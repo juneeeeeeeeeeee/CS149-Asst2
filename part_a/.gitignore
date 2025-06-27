@@ -1,2 +1,6 @@
 objs/
 runtasks
+runtasks_ref_linux
+runtasks_ref_linux_arm
+runtasks_ref_osx_arm
+runtasks_ref_osx_x86
