@@ -6,6 +6,7 @@
 #include <queue>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -83,6 +84,16 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int _numThreads;
+        std::thread* threads;
+        std::queue<std::pair<IRunnable*, int>> _taskQueue;
+        std::mutex _queueMutex;
+        std::atomic<int> _completedTasks;
+        std::condition_variable _queueCond;
+        int _numTotalTasks;
+        bool _isDone;
+        void threadLoop();
 };
 
 #endif

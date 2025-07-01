@@ -193,6 +193,12 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    threads = new std::thread[num_threads];
+    for (int i=0; i<num_threads; i++) {
+        threads[i] = std::thread(&TaskSystemParallelThreadPoolSleeping::threadLoop, this);
+    }
+    _numThreads = num_threads;
+    _isDone = false;
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -202,6 +208,12 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    _isDone = true;
+    _queueCond.notify_all();
+    for (int i = 0; i < _numThreads; i++) {
+        threads[i].join();
+    }
+    delete[] threads;
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
@@ -212,9 +224,36 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // method in Parts A and B.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-
+    _numTotalTasks = num_total_tasks;
+    _completedTasks.store(0);
+    _queueMutex.lock();
     for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+        _taskQueue.push({runnable, i});
+    }
+    _queueMutex.unlock();
+    _queueCond.notify_all();
+
+    while (_completedTasks.load() < _numTotalTasks) { // task is not done
+        std::this_thread::yield();
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::threadLoop() {
+    int taskId;
+    IRunnable* runnable;
+    while (true) {
+        std::unique_lock<std::mutex> lock(_queueMutex);
+        _queueCond.wait(lock, [this] {
+            return _isDone || !_taskQueue.empty();
+        });
+
+        if (_isDone && _taskQueue.empty()) break;
+        runnable = _taskQueue.front().first;
+        taskId = _taskQueue.front().second;
+        _taskQueue.pop();
+        lock.unlock();
+        runnable->runTask(taskId, _numTotalTasks);
+        _completedTasks.fetch_add(1);
     }
 }
 

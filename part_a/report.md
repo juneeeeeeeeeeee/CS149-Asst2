@@ -196,4 +196,198 @@ Results for: math_operations_in_tight_for_loop
 [Parallel + Thread Pool + Spin]         301.819   337.877     0.89  (OK)
 ================================================================================
 ```
-이 이후의 test는 실행이 너무 오래 걸려 포기했다. [Parallel + Always Spawn]이 잘 동작함을 확인할 수 있다. 여기서 thread pool이 많은 경우 thread를 재사용함으로서 overhead를 줄임을 확인할 수 있었다. 
+이 이후의 test는 실행이 너무 오래 걸려 포기했다. [Parallel + Thread Pool + Spin]이 잘 동작함을 확인할 수 있다. 여기서 thread pool이 많은 경우 thread를 재사용함으로서 overhead를 줄임을 확인할 수 있었다. 
+
+# thread sleep 사용
+thread에서 동작을 하지 않을 때 condition variable을 이용해 sleep한다. 이를 위해 class에 변수 `_queueCond`를 추가했다. `_queueCond`는 task queue를 wait하는 condition variable로 worker thread가 사용한다. 
+```cpp
+class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    public:
+        TaskSystemParallelThreadPoolSleeping(int num_threads);
+        ~TaskSystemParallelThreadPoolSleeping();
+        const char* name();
+        void run(IRunnable* runnable, int num_total_tasks);
+        TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
+                                const std::vector<TaskID>& deps);
+        void sync();
+    private:
+        int _numThreads;
+        std::thread* threads;
+        std::queue<std::pair<IRunnable*, int>> _taskQueue;
+        std::mutex _queueMutex;
+        std::atomic<int> _completedTasks;
+        std::condition_variable _queueCond;
+        std::condition_variable _completeCond;
+        int _numTotalTasks;
+        bool _isDone;
+        void threadLoop();
+};
+```
+
+main thread의 시작 코드는 앞과 동일하다. `run()` 함수는 아래와 같다. 
+```cpp
+void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
+    _numTotalTasks = num_total_tasks;
+    _completedTasks.store(0);
+    _queueMutex.lock();
+    for (int i = 0; i < num_total_tasks; i++) {
+        _taskQueue.push({runnable, i});
+    }
+    _queueMutex.unlock();
+    _queueCond.notify_all();
+
+    while (_completedTasks.load() < _numTotalTasks) { // task is not done
+        std::this_thread::yield();
+    }
+}
+```
+앞과 비교했을 때, queue에 task를 추가한 후 task queue를 wait하는 worker thread들을 모두 `notify_all()`을 호출해 깨운다. 한편 main thread 역시 worker thread가 작업을 완료하기를 기다리며 wait한다. 람다 함수를 이용하여 `lock` 뿐 아니라 전체 worker thread 작업이 완료될 때만 main thread를 깨우도록 하였다. 
+
+다음으로 전체 task가 완료되었을 때의 code는 아래와 같다. 
+```cpp
+TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
+    _isDone = true;
+    _queueCond.notify_all();
+    for (int i = 0; i < _numThreads; i++) {
+        threads[i].join();
+    }
+    delete[] threads;
+}
+```
+`_queueCond` 변수를 wait하는 worker thread들을 모두 `notify_all()`을 호출해 깨운다. 
+
+다음으로 worker thread의 함수 `threadLoop()`는 아래와 같다. 
+```cpp
+void TaskSystemParallelThreadPoolSleeping::threadLoop() {
+    int taskId;
+    IRunnable* runnable;
+    while (true) {
+        std::unique_lock<std::mutex> lock(_queueMutex);
+        _queueCond.wait(lock, [this] {
+            return _isDone || !_taskQueue.empty();
+        });
+
+        if (_isDone && _taskQueue.empty()) break;
+        runnable = _taskQueue.front().first;
+        taskId = _taskQueue.front().second;
+        _taskQueue.pop();
+        lock.unlock();
+        runnable->runTask(taskId, _numTotalTasks);
+        _completedTasks.fetch_add(1);
+    }
+}
+```
+worker thread는 다른 worker thread가 lock을 가지고 있지 않고, (작업을 완료했거나 task queue에 원소가 있으면) lock을 얻어 작업을 진행한다. 이때 작업을 완료했으며 task queue에 원소가 없으면 return한다. 
+
+그렇지 않은 경우 앞과 동일하게 queue에서 원소를 뽑아 실행한다. 이때 다른 worker thread의 작업을 위해 queue 작업이 완료되면 queue를 unlock해주어야 한다. 작업이 완료되고 `_completedTasks` 변수에 1을 더한다. 
+
+참고로 main thread에도 lock mechanism을 도입하니 오류가 난다. 왜 그런지는 모르겠다. 
+
+실행 결과는 아래와 같다. 
+```
+Executing test: super_super_light...
+Reference binary: ./runtasks_ref_linux
+Results for: super_super_light
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                5.659     5.724       0.99  (OK)
+[Parallel + Always Spawn]               92.569    84.84       1.09  (OK)
+[Parallel + Thread Pool + Spin]         13.171    24.147      0.55  (OK)
+[Parallel + Thread Pool + Sleep]        14.521    41.279      0.35  (OK)
+================================================================================
+Executing test: super_light...
+Reference binary: ./runtasks_ref_linux
+Results for: super_light
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                70.191    79.887      0.88  (OK)
+[Parallel + Always Spawn]               108.649   96.902      1.12  (OK)
+[Parallel + Thread Pool + Spin]         26.307    37.127      0.71  (OK)
+[Parallel + Thread Pool + Sleep]        53.924    55.732      0.97  (OK)
+================================================================================
+Executing test: ping_pong_equal...
+Reference binary: ./runtasks_ref_linux
+Results for: ping_pong_equal
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                1171.652  1331.995    0.88  (OK)
+[Parallel + Always Spawn]               415.655   465.521     0.89  (OK)
+[Parallel + Thread Pool + Spin]         417.976   461.547     0.91  (OK)
+[Parallel + Thread Pool + Sleep]        409.802   456.306     0.90  (OK)
+================================================================================
+Executing test: ping_pong_unequal...
+Reference binary: ./runtasks_ref_linux
+Results for: ping_pong_unequal
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                1968.492  1983.23     0.99  (OK)
+[Parallel + Always Spawn]               627.189   616.67      1.02  (OK)
+[Parallel + Thread Pool + Spin]         627.778   631.458     0.99  (OK)
+[Parallel + Thread Pool + Sleep]        655.341   603.198     1.09  (OK)
+================================================================================
+Executing test: recursive_fibonacci...
+Reference binary: ./runtasks_ref_linux
+Results for: recursive_fibonacci
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                1038.459  1641.315    0.63  (OK)
+[Parallel + Always Spawn]               324.034   387.224     0.84  (OK)
+[Parallel + Thread Pool + Spin]         382.724   446.2       0.86  (OK)
+[Parallel + Thread Pool + Sleep]        373.399   419.399     0.89  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop...
+Reference binary: ./runtasks_ref_linux
+Results for: math_operations_in_tight_for_loop
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                695.974   700.172     0.99  (OK)
+[Parallel + Always Spawn]               683.894   589.847     1.16  (OK)
+[Parallel + Thread Pool + Spin]         303.089   328.436     0.92  (OK)
+[Parallel + Thread Pool + Sleep]        376.799   417.168     0.90  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fewer_tasks...
+Reference binary: ./runtasks_ref_linux
+Results for: math_operations_in_tight_for_loop_fewer_tasks
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                693.155   716.211     0.97  (OK)
+[Parallel + Always Spawn]               706.861   603.958     1.17  (OK)
+[Parallel + Thread Pool + Spin]         366.675   400.297     0.92  (OK)
+[Parallel + Thread Pool + Sleep]        402.523   439.923     0.91  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fan_in...
+Reference binary: ./runtasks_ref_linux
+Results for: math_operations_in_tight_for_loop_fan_in
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                357.84    362.512     0.99  (OK)
+[Parallel + Always Spawn]               159.052   147.492     1.08  (OK)
+[Parallel + Thread Pool + Spin]         127.301   134.98      0.94  (OK)
+[Parallel + Thread Pool + Sleep]        133.73    135.128     0.99  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_reduction_tree...
+Reference binary: ./runtasks_ref_linux
+Results for: math_operations_in_tight_for_loop_reduction_tree
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                347.137   358.801     0.97  (OK)
+[Parallel + Always Spawn]               108.547   109.465     0.99  (OK)
+[Parallel + Thread Pool + Spin]         114.519   119.139     0.96  (OK)
+[Parallel + Thread Pool + Sleep]        115.152   113.989     1.01  (OK)
+================================================================================
+Executing test: spin_between_run_calls...
+Reference binary: ./runtasks_ref_linux
+Results for: spin_between_run_calls
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                367.156   580.798     0.63  (OK)
+[Parallel + Always Spawn]               196.185   308.013     0.64  (OK)
+[Parallel + Thread Pool + Spin]         271.051   456.967     0.59  (OK)
+[Parallel + Thread Pool + Sleep]        231.938   305.454     0.76  (OK)
+================================================================================
+Executing test: mandelbrot_chunked...
+Reference binary: ./runtasks_ref_linux
+Results for: mandelbrot_chunked
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                433.148   436.095     0.99  (OK)
+[Parallel + Always Spawn]               67.281    71.09       0.95  (OK)
+[Parallel + Thread Pool + Spin]         77.341    86.052      0.90  (OK)
+[Parallel + Thread Pool + Sleep]        79.136    70.647      1.12  (OK)
+================================================================================
+Overall performance results
+[Serial]                                : All passed Perf
+[Parallel + Always Spawn]               : All passed Perf
+[Parallel + Thread Pool + Spin]         : All passed Perf
+[Parallel + Thread Pool + Sleep]        : All passed Perf
+```
+[Parallel + Thread Pool + Sleep]이 잘 동작함을 확인할 수 있다. 다만 Spin과 차이가 생각보다 크지 않음을 확인할 수 있다. 
