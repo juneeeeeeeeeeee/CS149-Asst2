@@ -1,5 +1,4 @@
 #include "tasksys.h"
-#include <thread>
 
 IRunnable::~IRunnable() {}
 
@@ -110,9 +109,21 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    threads = new std::thread[num_threads];
+    for (int i=0; i<num_threads; i++) {
+        threads[i] = std::thread(&TaskSystemParallelThreadPoolSpinning::threadLoop, this);
+    }
+    _numThreads = num_threads;
+    _isDone = false;
 }
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {}
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+    _isDone = true;
+    for (int i = 0; i < _numThreads; i++) {
+        threads[i].join();
+    }
+    delete[] threads;
+}
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
 
@@ -122,9 +133,35 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     // method in Part A.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-
+    _numTotalTasks = num_total_tasks;
+    _completedTasks.store(0);
+    _queueMutex.lock();
     for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+        _taskQueue.push({runnable, i});
+    }
+    _queueMutex.unlock();
+
+    while (_completedTasks.load() < _numTotalTasks) { // task is not done
+        std::this_thread::yield();
+    }
+}
+
+void TaskSystemParallelThreadPoolSpinning::threadLoop() {
+    int taskId;
+    IRunnable* runnable;
+    while (!_isDone) {
+        taskId = -1;
+        _queueMutex.lock();
+        if (!_taskQueue.empty()) {
+            runnable = _taskQueue.front().first;
+            taskId = _taskQueue.front().second;
+            _taskQueue.pop();
+        }
+        _queueMutex.unlock();
+        if (taskId != -1) {
+            runnable->runTask(taskId, _numTotalTasks);
+            _completedTasks.fetch_add(1);
+        }
     }
 }
 

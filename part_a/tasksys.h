@@ -2,6 +2,10 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <mutex>
+#include <queue>
+#include <atomic>
+#include <thread>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -53,6 +57,15 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int _numThreads;
+        std::thread* threads;
+        std::queue<std::pair<IRunnable*, int>> _taskQueue;
+        std::mutex _queueMutex;
+        std::atomic<int> _completedTasks;
+        int _numTotalTasks;
+        bool _isDone;
+        void threadLoop();
 };
 
 /*
