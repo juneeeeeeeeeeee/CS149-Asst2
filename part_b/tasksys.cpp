@@ -139,6 +139,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     }
     _numThreads = num_threads;
     _nextTaskGroupId.store(0);
+    _isDone = false;
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -164,43 +165,45 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // method in Parts A and B.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-    runAsnycWithDeps(runnable, num_total_tasks, {});
+    runAsyncWithDeps(runnable, num_total_tasks, {});
     sync();
 }
 
 void TaskSystemParallelThreadPoolSleeping::threadLoop() {
-    
     while (true) {
         std::unique_lock<std::mutex> lock(_mutex);
         _worker_cv.wait(lock, [this] {
-            return _isDone || !_readyQueue.empty();
+            return _isDone || !_taskQueue.empty();
         });
 
-        if (_isDone && _readyQueue.empty()) break;
-        TaskGroupInfo* currentTaskGroup = _readyQueue.front();
-        _readyQueue.pop();
+        if (_isDone && _taskQueue.empty()) break;
+        TaskUnitInfo* currentTaskUnit = _taskQueue.front();
+        _taskQueue.pop();
         lock.unlock();
 
-        for (int i = 0; i < currentTaskGroup->numTotalTasks; i++) {
-            currentTaskGroup->runnable->runTask(i, currentTaskGroup->numTotalTasks);
-            currentTaskGroup->completedTasks.fetch_add(1);
-        }
+        currentTaskUnit->runnable->runTask(currentTaskUnit->id, currentTaskUnit->group->numTotalTasks);
         
         lock.lock();
-        // dependency check
-        for (TaskID dependentID : currentTaskGroup->dependents) {
-            TaskGroupInfo* dependentTaskGroup = _allTaskGroups[dependentID];
-            dependentTaskGroup->dependenciesLeft.fetch_sub(1);
-            if (dependentTaskGroup->dependenciesLeft.load() == 0) {
-                _readyQueue.push(dependentTaskGroup);
-                _worker_cv.notify_all();
+        if (currentTaskUnit->group->completedTasks.fetch_add(1) == currentTaskUnit->group->numTotalTasks - 1) {
+            // dependency check
+            for (TaskID dependentID : currentTaskUnit->group->dependents) {
+                TaskGroupInfo* dependentTaskGroup = _allTaskGroups[dependentID];
+                if (dependentTaskGroup->dependenciesLeft.fetch_sub(1) == 1) {
+                    for (int i = 0; i < dependentTaskGroup -> numTotalTasks; i++) {
+                        _taskQueue.push(new TaskUnitInfo{i, dependentTaskGroup->runnable, dependentTaskGroup});
+                    }
+                    _worker_cv.notify_all();
+                }
+            }
+            _allTaskGroups.erase(currentTaskUnit->group->id);
+            _activeTaskGroups.fetch_sub(1);
+            if (_activeTaskGroups.load() == 0) {
+                // notify sync function
+                delete currentTaskUnit->group;
+                _sync_cv.notify_one();
             }
         }
-        _activeTaskGroups.fetch_sub(1);
-        _allTaskGroups.erase(currentTaskGroup->id);
-        if (_activeTaskGroups.load() == 0) {
-            // notify sync function
-        }
+        delete currentTaskUnit;
         lock.unlock();
     }
 }
@@ -224,10 +227,12 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     // do something if it has dependencies
     for (TaskID dependentID : deps) {
         TaskGroupInfo* dependentTaskGroup = _allTaskGroups[dependentID];
-        dependentTaskGroup->dependents.push_back(newTaskGroup);
+        dependentTaskGroup->dependents.push_back(newTaskGroup->id);
     }
     if (deps.size() == 0) {
-        _readyQueue.push(newTaskGroup);
+        for (int i = 0; i < num_total_tasks; i++) {
+            _taskQueue.push(new TaskUnitInfo{i, runnable, newTaskGroup});
+        }
         _worker_cv.notify_all();
     }
     _allTaskGroups[newTaskGroup->id] = newTaskGroup;
@@ -242,6 +247,10 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
     //
     // TODO: CS149 students will modify the implementation of this method in Part B.
     //
-
+    std::unique_lock<std::mutex> lock(_mutex);
+    _sync_cv.wait(lock, [this]{
+        return !_activeTaskGroups.load();
+    });
+    lock.unlock();
     return;
 }

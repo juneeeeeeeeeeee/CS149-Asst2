@@ -8,6 +8,22 @@
 #include <thread>
 #include <condition_variable>
 #include <map>
+#include <iostream>
+
+typedef struct _TaskGroupInfo {
+    TaskID id; // group
+    IRunnable* runnable;
+    int numTotalTasks;
+    std::atomic<int> completedTasks;
+    std::atomic<int> dependenciesLeft;
+    std::vector<TaskID> dependents;
+} TaskGroupInfo;
+
+typedef struct _TaskUnitInfo {
+    TaskID id; // single task
+    IRunnable* runnable;
+    TaskGroupInfo* group; // used when task group end
+} TaskUnitInfo;
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -77,23 +93,15 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
     private:
         int _numThreads;
         std::thread* threads;
-        std::map<TaskID, TaskInfo*> _allTaskGroups;
-        std::queue<TaskInfo*> _readyQueue;
+        std::map<TaskID, TaskGroupInfo*> _allTaskGroups;
+        std::queue<TaskUnitInfo*> _taskQueue; // single task
         std::mutex _mutex;
-        std::atomic _activeTaskGroups;
-        std::atomic _nextTaskGroupId;
+        std::atomic<int> _activeTaskGroups;
+        std::atomic<int> _nextTaskGroupId;
         std::condition_variable _worker_cv;
+        std::condition_variable _sync_cv;
         bool _isDone;
         void threadLoop();
 };
-
-typedef struct _TaskGroupInfo {
-    TaskID id;
-    IRunnable* runnable;
-    int numTotalTasks;
-    std::atomic<int> completedTasks;
-    std::atomic<int> dependenciesLeft;
-    std::vector<TaskID> dependents;
-} TaskGroupInfo;
 
 #endif
